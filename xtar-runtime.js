@@ -1,4 +1,4 @@
-// xtar-runtime-v2
+// xtar-runtime-v3
 // Do not remove. Do not modify. Do not move.
 // Part of Xtarify agent infrastructure. Single vanilla bundle served from a
 // CDN (jsdelivr, from github.com/daybigo/xtar-runtime) and loaded via a
@@ -13,6 +13,14 @@
 (function () {
   'use strict';
   if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+  // Guard de doble carga: si un index.html quedo con DOS tags del runtime
+  // (p.ej. el local viejo + el del CDN tras una migracion a medias), el
+  // segundo script NO debe reinicializar — duplicaria los listeners del
+  // Studio Bridge (comandos de edicion aplicados dos veces), el wrap de
+  // fetch/console.error y los observers del error system.
+  if (window.XTAR_RUNTIME_VERSION) return;
+  window.XTAR_RUNTIME_VERSION = '3';
 
   // ====================================================================
   // 0) ROUTE REPORTER
@@ -1224,6 +1232,46 @@
     var dedupCache = new Map();
     var consoleBuffer = [];
     var consoleFlushTimer = null;
+    // Ultimo detalle de error real capturado (runtime/promise/console). Se
+    // adjunta al reporte kind:'react' de watchRootForCrash para que cada crash
+    // distinto tenga una FIRMA distinta (el auto-fix del IDE capea 2 intentos
+    // por firma; con un mensaje constante todos los crashes compartirian UN
+    // solo presupuesto) y para que el agente vea la causa concreta.
+    var lastErrorDetail = '';
+    var appReadyNotified = false;
+
+    function rememberErrorDetail(message) {
+      try {
+        var text = typeof message === 'string' ? message.replace(/\s+/g, ' ').trim() : '';
+        if (text) lastErrorDetail = text.slice(0, 300);
+      } catch (_error) { /* fail-safe */ }
+    }
+
+    // "El root tiene contenido" = tiene hijos Element O texto visible.
+    // root.children ignora text nodes: una app cuyo componente raiz renderiza
+    // texto pelado se veria como "vacia" y disparaba blank-screen/overlay
+    // sobre contenido visible.
+    function rootHasContent(root) {
+      if (!root) return false;
+      if (root.children.length > 0) return true;
+      var text = root.textContent;
+      return !!(text && text.replace(/\s+/g, '').length > 0);
+    }
+
+    // Avisa al IDE (una sola vez) que la app del usuario ya monto contenido.
+    // PreviewIframe usa esta senal para quitar el loader del preview sin
+    // esperar el evento load del iframe (que espera TODAS las subresources:
+    // una imagen/video de terceros colgado lo posterga minutos). Payload sin
+    // datos sensibles => '*' como el route reporter.
+    function notifyAppReady() {
+      if (appReadyNotified) return;
+      appReadyNotified = true;
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'XTAR_APP_READY', source: SOURCE }, '*');
+        }
+      } catch (_error) { /* fail-safe */ }
+    }
 
     function truncate(value, limit) {
       var max = limit || MAX_STRING_LENGTH;
@@ -1321,7 +1369,14 @@
 
     function handleRuntimeError(event) {
       try {
+        // Los fallos de carga de recursos (<img>/<script>/<link> caidos)
+        // llegan a este listener capture-phase como Event pelado, sin .error
+        // ni .message. No son errores de la app: sin este guard, cada asset
+        // remoto roto pintaba un card rojo "Runtime error" sin detalle en el
+        // IDE sobre una pagina perfectamente sana.
+        if (!event || (!event.error && !event.message)) return;
         var err = event.error;
+        rememberErrorDetail((err && err.message) || event.message || '');
         emit({
           kind: 'runtime',
           message: truncate((err && err.message) || event.message || 'Runtime error'),
@@ -1337,6 +1392,7 @@
       try {
         var reason = event.reason;
         var isError = reason instanceof Error;
+        rememberErrorDetail(isError ? reason.message : safeStringify(reason));
         emit({
           kind: 'promise',
           message: truncate(isError ? reason.message : safeStringify(reason)),
@@ -1353,6 +1409,10 @@
         var message = items
           .map(function (entry) { return entry.args.map(function (a) { return safeStringify(a); }).join(' '); })
           .join('\n');
+        // React 19 reporta los errores de render por console.error (via su
+        // onUncaughtError default en algunos paths); recordarlo alimenta la
+        // firma del reporte kind:'react'.
+        rememberErrorDetail(message);
         emit({ kind: 'console', message: truncate(message) });
       } catch (_error) { /* fail-safe */ }
     }
@@ -1411,7 +1471,7 @@
         var body = document.body;
         if (!body) return;
         var root = document.getElementById('root');
-        if (root && root.children.length > 0) return;
+        if (rootHasContent(root)) return;
         fallbackInjected = true;
 
         var overlay = document.createElement('div');
@@ -1459,13 +1519,31 @@
       } catch (_error) { /* fail-safe */ }
     }
 
+    // Contraparte de injectFallbackErrorScreen: si la app se RECUPERA (el
+    // auto-fix del agente llego via HMR, un remount tardio, o el crash fue un
+    // falso positivo), la pantalla de error NO debe quedar tapando la app
+    // sana. La llama el observer de watchRootForCrash al ver contenido.
+    function removeFallbackErrorScreen() {
+      try {
+        var overlay = document.getElementById('xtar-fallback-error-screen');
+        if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        fallbackInjected = false;
+      } catch (_error) { /* fail-safe */ }
+    }
+
     function checkBlankScreen() {
       try {
         var body = document.body;
         if (!body) return;
+        // Si watchRootForCrash ya reporto el crash e inyecto la pantalla, no
+        // emitir un SEGUNDO error auto-fixeable (blank-screen) por el mismo
+        // incidente: quemaria el presupuesto de auto-fix del IDE dos veces.
+        if (fallbackInjected) return;
         var root = document.getElementById('root');
-        var rootIsEmpty = !root || root.children.length === 0;
-        if (!rootIsEmpty) return;
+        if (rootHasContent(root)) {
+          notifyAppReady();
+          return;
+        }
         emit({
           kind: 'blank-screen',
           message: errorsReported > 0
@@ -1490,21 +1568,47 @@
     // (tenia contenido -> quedo vacio) y mostramos la pantalla de error vanilla.
     // Esto reemplaza al viejo <ErrorBoundary>/<ErrorScreen> de React: el
     // proyecto ya no trae ese componente; el fallback + el reporte viven aca.
+    // El MISMO observer ademas: (a) avisa XTAR_APP_READY al IDE cuando el root
+    // gana contenido por primera vez (senal de "quita el loader"), y (b) si la
+    // app se RECUPERA (HMR del auto-fix, remount tardio, falso positivo)
+    // REMUEVE la pantalla de error en vez de dejarla tapando la app sana.
     function watchRootForCrash() {
       try {
+        if (typeof MutationObserver === 'undefined') return;
         var root = document.getElementById('root');
-        if (!root || typeof MutationObserver === 'undefined') return;
-        var hadContent = root.children.length > 0;
+        if (!root) {
+          // Con carga async el script puede ejecutar antes de que el body este
+          // parseado: reintentar una vez cuando el DOM este listo.
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', watchRootForCrash, { once: true });
+          }
+          return;
+        }
+        var hadContent = rootHasContent(root);
+        if (hadContent) notifyAppReady();
         var observer = new MutationObserver(function () {
-          if (root.children.length > 0) { hadContent = true; return; }
+          if (rootHasContent(root)) {
+            hadContent = true;
+            notifyAppReady();
+            if (fallbackInjected) removeFallbackErrorScreen();
+            return;
+          }
           if (!hadContent || fallbackInjected) return;
           // Re-chequear tras un tick evita falsos positivos por transiciones
-          // breves donde el root queda vacio por un instante.
+          // breves donde el root queda vacio por un instante. Si aun asi se
+          // colara un falso positivo (patron raro tipo clear-then-remount
+          // lento), la rama de recuperacion de arriba lo auto-sana.
           setTimeout(function () {
             if (fallbackInjected) return;
             var current = document.getElementById('root');
-            if (current && current.children.length === 0) {
-              emit({ kind: 'react', message: 'React tree unmounted to an empty #root (uncaught render error)' });
+            if (current && !rootHasContent(current)) {
+              emit({
+                kind: 'react',
+                message: truncate(
+                  'React tree unmounted to an empty #root (uncaught render error)' +
+                    (lastErrorDetail ? ' :: ' + lastErrorDetail : '')
+                ),
+              });
               injectFallbackErrorScreen();
             }
           }, 160);
@@ -1716,13 +1820,24 @@
         'border-radius:50%;border:1px solid rgba(2,6,23,0.10);background:#ffffff;',
         'color:#64748b;cursor:pointer;pointer-events:auto;',
         'box-shadow:0 2px 6px rgba(2,6,23,0.18);',
+        '-webkit-tap-highlight-color:transparent;-webkit-appearance:none;appearance:none;',
         'transition:color 160ms ease,background 160ms ease,transform 160ms ease;}',
+        // hit-area extendida del boton (~35px de target tactil sin cambiar el
+        // visual de 19px): un tap apenas errado cae en el boton y NO en el
+        // pill de al lado (que navega a xtarify.com en pestana nueva).
+        '#xtar-badge-root .xtar-close::after{content:"";position:absolute;inset:-8px;border-radius:50%;}',
         '#xtar-badge-root .xtar-close:hover{background:#0b1220;color:#ffffff;transform:scale(1.08);}',
         '#xtar-badge-root .xtar-close:focus-visible{outline:2px solid #3b82f6;outline-offset:2px;}',
         '#xtar-badge-root .xtar-close svg{width:9px;height:9px;display:block;pointer-events:none;}',
-        // touch: sin mascota ni hit-area extendida (no hay hover); solo el pill
+        // touch: sin mascota ni hit-area extendida (no hay hover real); solo
+        // el pill + la x. Ademas se neutraliza el :hover EMULADO de los
+        // browsers tactiles (queda sticky tras un tap): sin esto el badge
+        // quedaba "crecido" 1.2x con la x corrida, y el link invisible del
+        // mascota quedaba armado sobre un area donde no se ve nada.
         '@media (hover:none){#xtar-badge-root .xtar-arc{display:none;}',
-        '#xtar-badge-root .xtar-anchor::before{display:none;}}',
+        '#xtar-badge-root .xtar-anchor::before{display:none;}',
+        '#xtar-badge-root .xtar-anchor:hover{transform:none;}',
+        '#xtar-badge-root .xtar-arc-link{display:none;}}',
         // reduced motion: revelar sin transform animado
         '@media (prefers-reduced-motion:reduce){',
         '#xtar-badge-root .xtar-anchor,#xtar-badge-root .xtar-arc-body{',
@@ -1838,5 +1953,4 @@
     }
   })();
 
-  window.XTAR_RUNTIME_VERSION = '2';
 })();
