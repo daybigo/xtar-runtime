@@ -1,4 +1,4 @@
-// xtar-runtime-v3
+// xtar-runtime-v4
 // Do not remove. Do not modify. Do not move.
 // Part of Xtarify agent infrastructure. Single vanilla bundle served from a
 // CDN (jsdelivr, from github.com/daybigo/xtar-runtime) and loaded via a
@@ -20,7 +20,7 @@
   // Studio Bridge (comandos de edicion aplicados dos veces), el wrap de
   // fetch/console.error y los observers del error system.
   if (window.XTAR_RUNTIME_VERSION) return;
-  window.XTAR_RUNTIME_VERSION = '3';
+  window.XTAR_RUNTIME_VERSION = '4';
 
   // ====================================================================
   // 0) ROUTE REPORTER
@@ -1810,24 +1810,35 @@
         'height:calc(var(--xtar-arc-w) / 1.405 - var(--xtar-arc-overlap));',
         'transform:translateX(-50%);z-index:4;pointer-events:none;}',
         '#xtar-badge-root .xtar-anchor:hover .xtar-arc-link{pointer-events:auto;cursor:pointer;}',
-        // boton de cerrar (x): esquina superior derecha del PILL, SIEMPRE
-        // visible, por ENCIMA de todo (z6 > manos z3 > link z4) => clickeable.
-        // Es hermano del pill (no puede ir dentro del <a>) y vive dentro del
-        // anchor, asi escala en lockstep con el pill en hover.
+        // boton de cerrar (x): esquina superior derecha del PILL. Oculto en
+        // reposo, visible SOLO en hover del badge (pedido del owner 2026-07-06;
+        // antes era siempre-visible). pointer-events:none en reposo para que un
+        // click en esa esquina no caiga en un boton invisible. En touch
+        // (hover:none, mas abajo) queda siempre visible: sin hover real un
+        // boton oculto seria inalcanzable. Por ENCIMA de todo
+        // (z6 > manos z3 > link z4) => clickeable. Es hermano del pill (no
+        // puede ir dentro del <a>) y vive dentro del anchor, asi escala en
+        // lockstep con el pill en hover.
         '#xtar-badge-root .xtar-close{position:absolute;top:-9px;right:-9px;z-index:6;',
         'width:19px;height:19px;margin:0;padding:0;box-sizing:border-box;',
         'display:flex;align-items:center;justify-content:center;',
         'border-radius:50%;border:1px solid rgba(2,6,23,0.10);background:#ffffff;',
-        'color:#64748b;cursor:pointer;pointer-events:auto;',
+        'color:#64748b;cursor:pointer;opacity:0;pointer-events:none;',
         'box-shadow:0 2px 6px rgba(2,6,23,0.18);',
         '-webkit-tap-highlight-color:transparent;-webkit-appearance:none;appearance:none;',
-        'transition:color 160ms ease,background 160ms ease,transform 160ms ease;}',
+        'transition:color 160ms ease,background 160ms ease,transform 160ms ease,',
+        'opacity 160ms ease;}',
+        // reveal de la x: hover sobre el badge (el ::before del anchor extiende
+        // la zona, asi que apuntar a la esquina tambien la revela)
+        '#xtar-badge-root .xtar-anchor:hover .xtar-close{opacity:1;pointer-events:auto;}',
         // hit-area extendida del boton (~35px de target tactil sin cambiar el
         // visual de 19px): un tap apenas errado cae en el boton y NO en el
         // pill de al lado (que navega a xtarify.com en pestana nueva).
         '#xtar-badge-root .xtar-close::after{content:"";position:absolute;inset:-8px;border-radius:50%;}',
         '#xtar-badge-root .xtar-close:hover{background:#0b1220;color:#ffffff;transform:scale(1.08);}',
-        '#xtar-badge-root .xtar-close:focus-visible{outline:2px solid #3b82f6;outline-offset:2px;}',
+        // teclado: al enfocar la x (Tab) tambien se revela, aunque no haya hover
+        '#xtar-badge-root .xtar-close:focus-visible{opacity:1;pointer-events:auto;',
+        'outline:2px solid #3b82f6;outline-offset:2px;}',
         '#xtar-badge-root .xtar-close svg{width:9px;height:9px;display:block;pointer-events:none;}',
         // touch: sin mascota ni hit-area extendida (no hay hover real); solo
         // el pill + la x. Ademas se neutraliza el :hover EMULADO de los
@@ -1837,6 +1848,8 @@
         '@media (hover:none){#xtar-badge-root .xtar-arc{display:none;}',
         '#xtar-badge-root .xtar-anchor::before{display:none;}',
         '#xtar-badge-root .xtar-anchor:hover{transform:none;}',
+        // touch: sin hover real no hay forma de revelar la x => queda visible
+        '#xtar-badge-root .xtar-close{opacity:1;pointer-events:auto;}',
         '#xtar-badge-root .xtar-arc-link{display:none;}}',
         // reduced motion: revelar sin transform animado
         '@media (prefers-reduced-motion:reduce){',
