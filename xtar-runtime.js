@@ -1,4 +1,4 @@
-// xtar-runtime-v4
+// xtar-runtime-v5
 // Do not remove. Do not modify. Do not move.
 // Part of Xtarify agent infrastructure. Single vanilla bundle served from a
 // CDN (jsdelivr, from github.com/daybigo/xtar-runtime) and loaded via a
@@ -20,7 +20,7 @@
   // Studio Bridge (comandos de edicion aplicados dos veces), el wrap de
   // fetch/console.error y los observers del error system.
   if (window.XTAR_RUNTIME_VERSION) return;
-  window.XTAR_RUNTIME_VERSION = '4';
+  window.XTAR_RUNTIME_VERSION = '5';
 
   // ====================================================================
   // 0) ROUTE REPORTER
@@ -64,7 +64,11 @@
   // Costo en frio: solo un message listener; el resto se monta tras enable().
   // ====================================================================
   (function studioBridge() {
-    var VERSION = '0.2.0';
+    // 0.3.0: getReactSource lee data-xtar-src (React 19 elimino _debugSource),
+    // emite ownerFileName (revive Symbol/Instance), self-heal de seleccion
+    // tras HMR, shift-click acumulativo. El PROTOCOLO postMessage sigue 0.2.0
+    // (sin mensajes nuevos ni cambios de firma).
+    var VERSION = '0.3.0';
     var MESSAGE_PREFIX = 'XTAR_STUDIO_';
     var MAX_TEXT_LENGTH = 700;
     var MAX_ATTR_LENGTH = 1200;
@@ -97,6 +101,11 @@
     var lastSelectedSnapshotKey = '';
     var cleanupTimer = 0;
     var bridgeStartedAt = 0;
+    // Clave de re-seleccion post-HMR: {src, nth, selector} del elemento
+    // seleccionado. React remonta nodos en cada HMR y los elementId del
+    // WeakMap mueren; con esto la seleccion se revive sola (ver el
+    // MutationObserver).
+    var selectedRestoreKey = null;
 
     var SAFE_ATTRIBUTES = {
       id: true,
@@ -499,31 +508,84 @@
       return null;
     }
 
+    // Parsea el atributo data-xtar-src="ruta/rel.tsx:linea:col" que inyecta
+    // el plugin de dev xtar-source-tagger.cjs (imagen base). Es el reemplazo
+    // de fiber._debugSource, que React 19 ELIMINO — sin esto, en React 19
+    // ningun elemento tenia fileName/lineNumber y toda la persistencia del
+    // Studio caia al matching fragil por literal de className.
+    function parseXtarSrc(element) {
+      try {
+        var raw = element && element.dataset ? element.dataset.xtarSrc : null;
+        if (!raw || typeof raw !== 'string') return null;
+        var parts = raw.split(':');
+        if (!parts[0]) return null;
+        return {
+          fileName: safeText(parts[0], MAX_ATTR_LENGTH),
+          lineNumber: parts[1] ? Number(parts[1]) || undefined : undefined,
+          columnNumber: parts[2] ? Number(parts[2]) || undefined : undefined,
+        };
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    // El owner fiber de un host element es el function component cuyo JSX lo
+    // creo. Como el tagger tagea TAMBIEN los call-sites de componentes
+    // (uppercase), el prop data-xtar-src en memoizedProps del owner ES la
+    // ubicacion del call-site (<Hero/> en Index.tsx) — el equivalente exacto
+    // del viejo owner._debugSource. _debugOwner sigue vivo en React 19 dev.
+    // Si el call-site vive en node_modules (p.ej. el router instancia la
+    // pagina), no hay prop => undefined => el toggle Symbol/Instance no
+    // aparece (correcto: ese call-site no es codigo del usuario).
+    function findOwnerCallSite(fiber) {
+      try {
+        var owner = fiber && fiber._debugOwner;
+        var hops = 0;
+        while (owner && hops < 4) {
+          var props = owner.memoizedProps;
+          var raw = props && props['data-xtar-src'];
+          if (typeof raw === 'string' && raw) {
+            var parts = raw.split(':');
+            if (parts[0]) {
+              return {
+                fileName: safeText(parts[0], MAX_ATTR_LENGTH),
+                lineNumber: parts[1] ? Number(parts[1]) || undefined : undefined,
+              };
+            }
+          }
+          owner = owner._debugOwner;
+          hops += 1;
+        }
+      } catch (_error) {
+        // fail-open
+      }
+      return null;
+    }
+
     function getReactSource(element) {
       var fiber = findReactFiber(element);
-      if (!fiber) {
-        var datasetSrc = element.dataset && element.dataset.xtarSrc;
-        if (datasetSrc) {
-          var parts = datasetSrc.split(':');
-          return {
-            fileName: safeText(parts[0] || '', MAX_ATTR_LENGTH),
-            lineNumber: parts[1] ? Number(parts[1]) : undefined,
-            columnNumber: parts[2] ? Number(parts[2]) : undefined,
-          };
-        }
-        return undefined;
-      }
-      var source = fiber._debugSource || undefined;
+      // El dataset se consulta SIEMPRE, no solo sin fiber: en React 19 el
+      // fiber existe pero sin _debugSource, y antes ni se llegaba a esta rama.
+      var domSrc = parseXtarSrc(element);
+      if (!fiber) return domSrc || undefined;
+      var dbg = fiber._debugSource || null; // compat React <19
       var owner = fiber._debugOwner || undefined;
       var componentName = fiber.elementType && (fiber.elementType.displayName || fiber.elementType.name);
       var ownerName = owner && owner.elementType && (owner.elementType.displayName || owner.elementType.name);
-      if (!source && !componentName && !ownerName) return undefined;
+      var ownerDbg = owner && owner._debugSource; // compat React <19
+      var ownerSite = ownerDbg && ownerDbg.fileName
+        ? { fileName: safeText(ownerDbg.fileName, MAX_ATTR_LENGTH), lineNumber: ownerDbg.lineNumber || undefined }
+        : findOwnerCallSite(fiber);
+      var fileName = dbg && dbg.fileName ? safeText(dbg.fileName, MAX_ATTR_LENGTH) : (domSrc ? domSrc.fileName : undefined);
+      if (!fileName && !componentName && !ownerName && !ownerSite) return undefined;
       return {
-        fileName: source && source.fileName ? safeText(source.fileName, MAX_ATTR_LENGTH) : undefined,
-        lineNumber: source && source.lineNumber ? source.lineNumber : undefined,
-        columnNumber: source && source.columnNumber ? source.columnNumber : undefined,
+        fileName: fileName || undefined,
+        lineNumber: (dbg && dbg.lineNumber) || (domSrc && domSrc.lineNumber) || undefined,
+        columnNumber: (dbg && dbg.columnNumber) || (domSrc && domSrc.columnNumber) || undefined,
         componentName: componentName ? safeText(componentName, 160) : undefined,
         ownerName: ownerName ? safeText(ownerName, 160) : undefined,
+        ownerFileName: ownerSite ? ownerSite.fileName : undefined,
+        ownerLineNumber: ownerSite && ownerSite.lineNumber ? ownerSite.lineNumber : undefined,
       };
     }
 
@@ -565,6 +627,53 @@
         element.className || '',
         (element.textContent || '').length,
       ].join('|');
+    }
+
+    // ---- Self-heal de seleccion tras HMR (v5) ----
+    // data-xtar-src (del tagger de la imagen base) + nth entre duplicados
+    // (listas .map comparten el mismo src) + fallback al CSS-path viejo.
+    function escapeAttrValue(value) {
+      return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    }
+
+    function captureRestoreKey(element) {
+      try {
+        var src = (element && element.dataset && element.dataset.xtarSrc) || null;
+        var nth = -1;
+        if (src) {
+          var matches = document.querySelectorAll('[data-xtar-src="' + escapeAttrValue(src) + '"]');
+          for (var i = 0; i < matches.length; i += 1) {
+            if (matches[i] === element) { nth = i; break; }
+          }
+        }
+        return { src: src, nth: nth, selector: buildSelector(element) };
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    function reviveSelection() {
+      if (!selectedRestoreKey) return null;
+      try {
+        if (selectedRestoreKey.src) {
+          var matches = document.querySelectorAll(
+            '[data-xtar-src="' + escapeAttrValue(selectedRestoreKey.src) + '"]',
+          );
+          if (matches.length > 0) {
+            var index =
+              selectedRestoreKey.nth >= 0 && selectedRestoreKey.nth < matches.length
+                ? selectedRestoreKey.nth
+                : 0;
+            return matches[index];
+          }
+        }
+        if (selectedRestoreKey.selector) {
+          return document.querySelector(selectedRestoreKey.selector);
+        }
+      } catch (_error) {
+        // fail-open: sin revive, la seleccion se pierde (comportamiento viejo)
+      }
+      return null;
     }
 
     function updateBox(box, element, color) {
@@ -696,6 +805,22 @@
         if (mutationTimer) return;
         mutationTimer = window.setTimeout(function () {
           mutationTimer = 0;
+          // Self-heal (v5): si HMR remonto el arbol y el nodo seleccionado
+          // salio del DOM, revivir la seleccion por data-xtar-src + nth
+          // (fallback CSS-path). El host recibe el SELECT como si el usuario
+          // hubiera re-clickeado — no necesita logica nueva.
+          if (selectedElement && active && !document.contains(selectedElement)) {
+            var revived = reviveSelection();
+            if (revived) {
+              selectedElement = revived;
+              hoverElement = null;
+              lastSelectedSnapshotKey = snapshotKey(revived);
+              post('XTAR_STUDIO_SELECT', { snapshot: buildSnapshot(revived) });
+            } else {
+              selectedElement = null;
+              if (selectedBox) selectedBox.style.display = 'none';
+            }
+          }
           scheduleBoxUpdate();
           scheduleResizeReport();
           if (selectedElement && active) {
@@ -758,6 +883,16 @@
       event.stopPropagation();
       if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
       if (event.shiftKey) {
+        // Acumulativo (v5, UX Figma): el primer shift-click arranca el
+        // multi-select INCLUYENDO la seleccion simple previa.
+        if (
+          multiElements.length === 0 &&
+          selectedElement &&
+          selectedElement !== element &&
+          document.contains(selectedElement)
+        ) {
+          multiElements.push(selectedElement);
+        }
         var index = multiElements.indexOf(element);
         if (index === -1) multiElements.push(element);
         else multiElements.splice(index, 1);
@@ -771,6 +906,7 @@
       refreshMultiBoxes();
       selectedElement = element;
       hoverElement = element;
+      selectedRestoreKey = captureRestoreKey(element);
       lastSelectedSnapshotKey = snapshotKey(element);
       scheduleBoxUpdate();
       post('XTAR_STUDIO_SELECT', { snapshot: buildSnapshot(element) });
@@ -831,6 +967,7 @@
       if (!isTextEditableElement(element)) return false;
       if (inlineTextRecord) finishInlineText(true);
       selectedElement = element;
+      selectedRestoreKey = captureRestoreKey(element);
       inlineTextRecord = {
         element: element,
         originalText: element.textContent || '',
@@ -867,6 +1004,7 @@
         multiElements = [];
         refreshMultiBoxes();
         selectedElement = null;
+        selectedRestoreKey = null;
         if (inlineTextRecord) finishInlineText(false);
         if (selectedBox) selectedBox.style.display = 'none';
       }
@@ -988,6 +1126,7 @@
       active = false;
       if (inlineTextRecord) finishInlineText(true);
       selectedElement = null;
+      selectedRestoreKey = null;
       hoverElement = null;
       multiElements = [];
       unbindEvents();
@@ -1140,6 +1279,7 @@
       }
       selectedElement = element;
       hoverElement = element;
+      selectedRestoreKey = captureRestoreKey(element);
       lastSelectedSnapshotKey = snapshotKey(element);
       scheduleBoxUpdate();
       post('XTAR_STUDIO_SELECT', { requestId: message.requestId, snapshot: buildSnapshot(element) });
