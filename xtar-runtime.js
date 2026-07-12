@@ -1,4 +1,4 @@
-// xtar-runtime-v5
+// xtar-runtime-v6
 // Do not remove. Do not modify. Do not move.
 // Part of Xtarify agent infrastructure. Single vanilla bundle served from a
 // CDN (jsdelivr, from github.com/daybigo/xtar-runtime) and loaded via a
@@ -20,7 +20,7 @@
   // Studio Bridge (comandos de edicion aplicados dos veces), el wrap de
   // fetch/console.error y los observers del error system.
   if (window.XTAR_RUNTIME_VERSION) return;
-  window.XTAR_RUNTIME_VERSION = '5';
+  window.XTAR_RUNTIME_VERSION = '6';
 
   // ====================================================================
   // 0) ROUTE REPORTER
@@ -1757,6 +1757,83 @@
       } catch (_error) { /* fail-safe */ }
     }
 
+    // WebGL muerto (Super3D, v6): un hero 3D roto COMPILA perfecto (el render
+    // gate no lo ve) y NO crashea React (watchRootForCrash tampoco): la pagina
+    // queda "sana" con un canvas negro/vacio. Tres senales FIABLES, cero
+    // heuristica de pixels (leer pixels de un canvas WebGL sin
+    // preserveDrawingBuffer devuelve vacio siempre => falsos positivos):
+    //   a) getContext('webgl'/'webgl2') devuelve null o lanza (GPU/driver no
+    //      disponible, blocklist, contexto agotado);
+    //   b) 'webglcontextlost' sin 'webglcontextrestored' en 4s;
+    //   c) se creo un contexto WebGL pero CERO requestAnimationFrame corrieron
+    //      en los 8s siguientes (el loop de render de R3F esta muerto; un
+    //      frameloop sano, incluso en modo demand, dispara al menos el primer
+    //      frame por rAF).
+    // En sitios SIN canvas WebGL nada de esto corre (dormido): el wrap de
+    // getContext es pass-through para '2d' y demas. Reporta UNA sola vez.
+    function watchWebGL() {
+      try {
+        if (typeof HTMLCanvasElement === 'undefined') return;
+        var reported = false;
+        var rafSeen = 0;
+        var origRaf = window.requestAnimationFrame;
+        if (typeof origRaf === 'function') {
+          window.requestAnimationFrame = function (cb) {
+            rafSeen++;
+            return origRaf.call(window, cb);
+          };
+        }
+        function reportDead(reason) {
+          if (reported) return;
+          reported = true;
+          rememberErrorDetail(reason);
+          emit({ kind: 'webgl-dead', message: truncate(reason) });
+        }
+        var origGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function (type) {
+          var isWebGL = type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl';
+          var ctx;
+          try {
+            ctx = origGetContext.apply(this, arguments);
+          } catch (err) {
+            if (isWebGL) {
+              reportDead('WebGL context creation threw: ' + ((err && err.message) || 'unknown'));
+            }
+            throw err;
+          }
+          if (!isWebGL) return ctx;
+          if (!ctx) {
+            reportDead('WebGL context creation returned null (GPU/driver unavailable)');
+            return ctx;
+          }
+          try {
+            var canvas = this;
+            canvas.addEventListener('webglcontextlost', function () {
+              var restored = false;
+              var onRestored = function () {
+                restored = true;
+                canvas.removeEventListener('webglcontextrestored', onRestored);
+              };
+              canvas.addEventListener('webglcontextrestored', onRestored);
+              setTimeout(function () {
+                if (!restored) reportDead('WebGL context lost and not restored within 4s');
+              }, 4000);
+            }, false);
+            // Watchdog del frame-loop: one-shot por contexto creado. Umbral
+            // CERO frames = solo un loop genuinamente muerto (un demand-mode
+            // estatico igual renderiza su primer frame via rAF al montar).
+            var baseline = rafSeen;
+            setTimeout(function () {
+              if (rafSeen - baseline < 1) {
+                reportDead('WebGL canvas created but no animation frames ran in 8s (dead render loop)');
+              }
+            }, 8000);
+          } catch (_error) { /* fail-safe */ }
+          return ctx;
+        };
+      } catch (_error) { /* fail-safe */ }
+    }
+
     function init() {
       if (initialized) return;
       initialized = true;
@@ -1767,6 +1844,7 @@
         wrapConsoleError();
         wrapFetch();
         watchRootForCrash();
+        watchWebGL();
         var scheduleBlankCheck = function () { setTimeout(checkBlankScreen, BLANK_SCREEN_CHECK_DELAY_MS); };
         if (document.readyState === 'complete') scheduleBlankCheck();
         else window.addEventListener('load', scheduleBlankCheck, { once: true });
